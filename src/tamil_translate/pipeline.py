@@ -8,16 +8,16 @@ with progress tracking, error handling, and resume capability.
 import logging
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple
 
 from tqdm import tqdm
 
 from tamil_translate.config import Config, get_config
 from tamil_translate.ocr_engine import (
-    OCREngine,
     OCRResult,
     TesseractOCREngine,
     create_ocr_engine,
@@ -74,7 +74,7 @@ class TranslationPipeline:
     2. Load or create state (for resume capability)
     3. For each page:
        a. Extract page image
-       b. OCR with PaddleOCR
+       b. OCR with Tesseract
        c. Translate to English
        d. Translate to Tamil (two-step)
        e. Update state atomically
@@ -86,7 +86,6 @@ class TranslationPipeline:
         self,
         config: Optional[Config] = None,
         on_page_complete: Optional[Callable[[int, float], None]] = None,
-        ocr_backend: str = "auto",
     ):
         """
         Initialize the translation pipeline.
@@ -94,14 +93,12 @@ class TranslationPipeline:
         Args:
             config: Configuration instance (default: global config)
             on_page_complete: Optional callback(page_num, cost) after each page
-            ocr_backend: OCR backend to use ("tesseract", "paddle", or "auto")
         """
         self.config = config or get_config()
         self.on_page_complete = on_page_complete
-        self.ocr_backend = ocr_backend
 
         # Components (lazy initialized)
-        self._ocr_engine: Optional[Union[OCREngine, TesseractOCREngine]] = None
+        self._ocr_engine: Optional[TesseractOCREngine] = None
         self._translator: Optional[TranslationService] = None
         self._state_manager: Optional[StateManager] = None
 
@@ -109,9 +106,28 @@ class TranslationPipeline:
         self._current_state: Optional[PipelineState] = None
         self._interrupted = False
 
-        # Register signal handler for graceful shutdown
-        signal.signal(signal.SIGINT, self._handle_interrupt)
-        signal.signal(signal.SIGTERM, self._handle_interrupt)
+        # Previous signal handlers (saved during run)
+        self._prev_sigint = None
+        self._prev_sigterm = None
+
+    def _setup_signal_handlers(self) -> None:
+        """Register signal handlers for graceful shutdown during run()."""
+        # Signal handlers can only be set in the main thread
+        if threading.current_thread() is not threading.main_thread():
+            logger.debug("Skipping signal handlers (not in main thread)")
+            return
+        self._prev_sigint = signal.signal(signal.SIGINT, self._handle_interrupt)
+        self._prev_sigterm = signal.signal(signal.SIGTERM, self._handle_interrupt)
+
+    def _restore_signal_handlers(self) -> None:
+        """Restore previous signal handlers after run() completes."""
+        # Only restore if we're in the main thread and handlers were set
+        if threading.current_thread() is not threading.main_thread():
+            return
+        if self._prev_sigint is not None:
+            signal.signal(signal.SIGINT, self._prev_sigint)
+        if self._prev_sigterm is not None:
+            signal.signal(signal.SIGTERM, self._prev_sigterm)
 
     def _handle_interrupt(self, signum, frame) -> None:
         """Handle interrupt signals gracefully."""
@@ -126,11 +142,21 @@ class TranslationPipeline:
             except Exception as e:
                 logger.error(f"Failed to save state: {e}")
 
+    def request_interrupt(self) -> None:
+        """
+        Request the pipeline to stop gracefully.
+
+        Thread-safe method to signal interruption from external code (e.g., TUI).
+        The pipeline will save state and exit at the next safe checkpoint.
+        """
+        self._interrupted = True
+        logger.info("Interrupt requested via request_interrupt()")
+
     @property
-    def ocr_engine(self) -> Union[OCREngine, TesseractOCREngine]:
+    def ocr_engine(self) -> TesseractOCREngine:
         """Get or create OCR engine."""
         if self._ocr_engine is None:
-            self._ocr_engine = create_ocr_engine(backend=self.ocr_backend)
+            self._ocr_engine = create_ocr_engine()
         return self._ocr_engine
 
     @property
@@ -169,6 +195,9 @@ class TranslationPipeline:
             PipelineResult with status and paths
         """
         start_time = time.time()
+
+        # Set up signal handlers for graceful shutdown
+        self._setup_signal_handlers()
 
         try:
             # 1. Validate input (skip API key check for dry runs)
@@ -330,6 +359,9 @@ class TranslationPipeline:
                 processing_time=processing_time,
                 error=str(e),
             )
+        finally:
+            # Restore previous signal handlers
+            self._restore_signal_handlers()
 
     def _load_or_create_state(
         self,
@@ -484,7 +516,6 @@ class TranslationPipeline:
 def create_pipeline(
     config: Optional[Config] = None,
     on_page_complete: Optional[Callable[[int, float], None]] = None,
-    ocr_backend: str = "auto",
 ) -> TranslationPipeline:
     """
     Factory function to create a translation pipeline.
@@ -492,7 +523,6 @@ def create_pipeline(
     Args:
         config: Optional configuration
         on_page_complete: Optional callback after each page
-        ocr_backend: OCR backend ("tesseract", "paddle", or "auto")
 
     Returns:
         Configured TranslationPipeline instance
@@ -500,5 +530,4 @@ def create_pipeline(
     return TranslationPipeline(
         config=config,
         on_page_complete=on_page_complete,
-        ocr_backend=ocr_backend,
     )

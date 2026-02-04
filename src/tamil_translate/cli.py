@@ -76,11 +76,18 @@ def parse_page_range(page_str: str, max_pages: int) -> Tuple[int, int]:
         parts = page_str.split("-")
         start = int(parts[0])
         end = int(parts[1])
-        return (max(1, start), min(max_pages, end))
+        # Swap if start > end
+        if start > end:
+            start, end = end, start
+        # Clamp to valid range
+        start = max(1, min(max_pages, start))
+        end = max(1, min(max_pages, end))
+        return (start, end)
 
-    # Single page number - treat as range to that page
+    # Single page number - treat as that single page only
     page_num = int(page_str)
-    return (1, min(max_pages, page_num))
+    page_num = max(1, min(max_pages, page_num))
+    return (page_num, page_num)
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -124,7 +131,7 @@ Examples:
 Environment Variables:
   SARVAM_API_KEY    Your Sarvam AI API key (required)
   MAX_WORKERS       Number of concurrent workers (default: 5)
-  MAX_CHUNK_SIZE    Max characters per API request (default: 800)
+  MAX_CHUNK_SIZE    Max characters per API request (default: 1800)
   OCR_DPI           DPI for PDF rendering (default: 400)
         """,
     )
@@ -187,14 +194,6 @@ Environment Variables:
         "--check-fonts",
         action="store_true",
         help="Check if required fonts are installed",
-    )
-
-    parser.add_argument(
-        "--ocr",
-        type=str,
-        choices=["tesseract", "paddle", "auto"],
-        default="auto",
-        help="OCR backend: tesseract (best for Sanskrit), paddle, or auto (default: auto)",
     )
 
     parser.add_argument(
@@ -338,7 +337,7 @@ def cmd_translate(args: argparse.Namespace) -> int:
     print(f"{'='*50}")
     print(f"Input:  {input_path.name}")
     print(f"Pages:  {page_range[0]}-{page_range[1]} ({expected_pages} pages)")
-    print(f"OCR:    {args.ocr} (DPI: {config.OCR_DPI})")
+    print(f"OCR:    Tesseract (DPI: {config.OCR_DPI})")
     print(f"Preprocess: {'Yes' if config.OCR_PREPROCESS_ENABLED else 'No'}")
     print(f"Chunk size: {config.MAX_CHUNK_SIZE} chars")
     print(f"Mode:   {'Dry run' if args.dry_run else 'Full processing'}")
@@ -354,7 +353,6 @@ def cmd_translate(args: argparse.Namespace) -> int:
     pipeline = create_pipeline(
         config=config,
         on_page_complete=on_page_complete,
-        ocr_backend=args.ocr,
     )
 
     result = pipeline.run(
@@ -400,6 +398,12 @@ def main() -> int:
     # Handle subcommands
     if args.check_fonts:
         return cmd_check_fonts()
+
+    # Launch TUI if no input file provided
+    if not args.input:
+        from tamil_translate.tui import run_tui
+
+        return run_tui()
 
     return cmd_translate(args)
 

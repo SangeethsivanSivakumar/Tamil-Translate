@@ -83,7 +83,7 @@ def load_api_key_securely() -> str:
     # Check for placeholder keys
     if api_key.lower() in FORBIDDEN_API_KEYS:
         raise InvalidAPIKeyError(
-            f"Placeholder API key detected: '{api_key[:20]}...'\n"
+            "Placeholder API key detected. "
             "Replace with your actual key from: https://dashboard.sarvam.ai"
         )
 
@@ -140,7 +140,18 @@ class SecurePDFValidator:
         Raises:
             InvalidPDFError: If any validation check fails
         """
-        path = Path(pdf_path).resolve()
+        # Check for symbolic links BEFORE resolving
+        raw_path = Path(pdf_path)
+        if raw_path.is_symlink():
+            raise InvalidPDFError("Symbolic links are not allowed for security reasons")
+
+        # Check if any parent is a symlink
+        for parent in raw_path.parents:
+            if parent.is_symlink():
+                raise InvalidPDFError("Symbolic links in path are not allowed for security reasons")
+
+        # Now resolve to absolute path
+        path = raw_path.resolve()
 
         # 1. File existence
         if not path.exists():
@@ -149,11 +160,7 @@ class SecurePDFValidator:
         if not path.is_file():
             raise InvalidPDFError(f"Path is not a file: {path}")
 
-        # 2. Reject symbolic links (could point outside allowed dirs)
-        if path.is_symlink():
-            raise InvalidPDFError("Symbolic links are not allowed for security reasons")
-
-        # 3. File size check (prevent PDF bombs)
+        # 2. File size check (prevent PDF bombs)
         file_size = path.stat().st_size
         if file_size > self.max_size_bytes:
             max_mb = self.max_size_bytes / (1024 * 1024)
@@ -264,12 +271,18 @@ class SecureFileHandler:
         Raises:
             PathTraversalError: If path is outside allowed directories
         """
-        # Resolve to absolute path (handles .., symlinks, etc.)
-        path = Path(user_path).resolve()
-
-        # Check for symbolic links
-        if path.is_symlink():
+        # Check for symbolic links BEFORE resolving
+        raw_path = Path(user_path)
+        if raw_path.is_symlink():
             raise PathTraversalError("Symbolic links are not allowed for input files")
+
+        # Check if any parent is a symlink
+        for parent in raw_path.parents:
+            if parent.is_symlink():
+                raise PathTraversalError("Symbolic links in path are not allowed for input files")
+
+        # Now resolve to absolute path
+        path = raw_path.resolve()
 
         # Check if path is within allowed directories
         is_allowed = any(
@@ -360,8 +373,17 @@ def sanitize_filename(filename: str, max_length: int = 255) -> str:
         # Find extension
         if "." in filename:
             name, ext = filename.rsplit(".", 1)
-            max_name_len = max_length - len(ext) - 1
-            filename = f"{name[:max_name_len]}.{ext}"
+            # Handle empty extension (filename ending with dot)
+            if not ext:
+                # Strip trailing dots and truncate
+                filename = name.rstrip(".")[:max_length]
+            else:
+                max_name_len = max_length - len(ext) - 1
+                if max_name_len > 0:
+                    filename = f"{name[:max_name_len]}.{ext}"
+                else:
+                    # Extension too long, truncate whole filename
+                    filename = filename[:max_length]
         else:
             filename = filename[:max_length]
 

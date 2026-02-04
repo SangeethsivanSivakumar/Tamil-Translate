@@ -147,12 +147,11 @@ class PDFGenerator:
             )
 
         try:
-            # Add font with Unicode support
+            # Add font with Unicode support (uni=True is deprecated in fpdf2)
             self._pdf.add_font(
                 font_config["name"],
                 "",
                 str(font_path),
-                uni=True,
             )
             self._pdf.set_font(font_config["name"], size=self.font_size)
             self._font_loaded = True

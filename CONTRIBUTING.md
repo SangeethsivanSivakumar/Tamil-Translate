@@ -103,7 +103,7 @@ black src/ && ruff check src/ && mypy src/
 ### Python Style
 
 - **PEP 8** compliance with modifications
-- **Line length**: 100 characters (Black default)
+- **Line length**: 100 characters (configured via `line-length = 100` in pyproject.toml; Black's default is 88)
 - **Type hints**: Required for all functions (Python 3.9+ syntax)
 - **Docstrings**: Required for all public modules, classes, and functions
 
@@ -155,7 +155,7 @@ def example_function(text: str, count: Optional[int] = None) -> dict:
 
 #### Medium Priority
 - **Performance**: Optimize chunking and translation logic
-- **Additional OCR Backends**: Tesseract integration
+- **OCR Improvements**: Tune TesseractOCREngine accuracy, add CI tests for OCR quality
 - **Language Support**: Add more language pairs
 
 #### Low Priority

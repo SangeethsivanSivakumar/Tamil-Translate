@@ -1,12 +1,11 @@
 """
-OCR processing module supporting multiple OCR backends.
+OCR processing module using Tesseract for Sanskrit/Hindi text extraction.
 
-Supports:
-- Tesseract OCR with Sanskrit/Hindi language packs (recommended for manuscripts)
-- PaddleOCR PP-OCRv3 for modern Hindi text
-
-Handles text extraction from PDF pages with Devanagari script support,
-adaptive preprocessing for low-confidence pages, and Unicode normalization.
+Features:
+- Sanskrit (san) and Hindi (hin) language support via Tesseract
+- Adaptive preprocessing for low-confidence results
+- Unicode NFC normalization for consistent output
+- Memory-efficient page streaming
 """
 
 import gc
@@ -18,7 +17,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Literal, Optional, Tuple, Union
+from typing import Iterator, Optional, Tuple
 
 from PIL import Image, ImageEnhance, ImageFilter
 
@@ -100,20 +99,34 @@ class TesseractOCREngine:
         """
         start_time = time.time()
 
-        # Run Tesseract OCR
-        result = subprocess.run(
-            [
-                self._tesseract_path,
-                str(image_path),
-                "stdout",
-                "-l", self.languages,
-                "--psm", str(self.psm),
-            ],
-            capture_output=True,
-            text=True,
-        )
-
-        full_text = result.stdout.strip()
+        # Run Tesseract OCR with timeout
+        # Note: close_fds=True is needed for thread safety when running from worker threads
+        try:
+            result = subprocess.run(
+                [
+                    self._tesseract_path,
+                    str(image_path),
+                    "stdout",
+                    "-l", self.languages,
+                    "--psm", str(self.psm),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                close_fds=True,
+            )
+            full_text = result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            logger.error(f"Page {page_num}: Tesseract OCR timed out after 120 seconds")
+            return OCRResult(
+                page_num=page_num,
+                full_text="",
+                confidence=0.0,
+                language_detected="sa-IN",
+                processing_time=time.time() - start_time,
+                line_count=0,
+                char_count=0,
+            )
 
         # Apply Unicode normalization (NFC)
         full_text = self.normalize_unicode(full_text)
@@ -163,6 +176,7 @@ class TesseractOCREngine:
         # If preprocessing is enabled, apply it BEFORE initial OCR
         if config.OCR_PREPROCESS_ENABLED:
             logger.debug(f"Page {page_num}: Applying preprocessing pipeline before OCR")
+            tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                     tmp_path = Path(tmp.name)
@@ -171,7 +185,6 @@ class TesseractOCREngine:
                 processed_image.save(tmp_path)
 
                 result = self.extract_text(tmp_path, page_num)
-                tmp_path.unlink()
 
                 if result.is_high_confidence():
                     return result
@@ -193,6 +206,9 @@ class TesseractOCREngine:
             except Exception as e:
                 logger.warning(f"Page {page_num}: Preprocessing failed ({e}), using original")
                 return self.extract_text(image_path, page_num)
+            finally:
+                if tmp_path is not None and tmp_path.exists():
+                    tmp_path.unlink()
 
         # Preprocessing disabled: use original approach
         result = self.extract_text(image_path, page_num)
@@ -351,8 +367,26 @@ class TesseractOCREngine:
             import numpy as np
 
             img_array = np.array(image)
-            if len(img_array.shape) == 3:
-                denoised = cv2.fastNlMeansDenoisingColored(img_array, None, 10, 10, 7, 21)
+            if len(img_array.shape) == 3 and img_array.shape[2] >= 3:
+                # Handle alpha channel if present
+                has_alpha = img_array.shape[2] == 4
+                if has_alpha:
+                    alpha = img_array[:, :, 3]
+                    rgb = img_array[:, :, :3]
+                else:
+                    rgb = img_array
+
+                # Convert RGB to BGR for OpenCV
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                denoised_bgr = cv2.fastNlMeansDenoisingColored(bgr, None, 10, 10, 7, 21)
+                # Convert BGR back to RGB
+                denoised_rgb = cv2.cvtColor(denoised_bgr, cv2.COLOR_BGR2RGB)
+
+                if has_alpha:
+                    # Reattach alpha channel
+                    denoised = np.dstack((denoised_rgb, alpha)).astype(np.uint8)
+                else:
+                    denoised = denoised_rgb.astype(np.uint8)
             else:
                 denoised = cv2.fastNlMeansDenoising(img_array, None, 10, 7, 21)
             return Image.fromarray(denoised)
@@ -368,424 +402,6 @@ class TesseractOCREngine:
     def normalize_unicode(text: str) -> str:
         """Normalize Unicode text to NFC form."""
         return unicodedata.normalize("NFC", text)
-
-
-class OCREngine:
-    """
-    OCR engine using PaddleOCR PP-OCRv3 for Devanagari text extraction.
-
-    Note: For classical Sanskrit manuscripts, TesseractOCREngine is recommended.
-
-    Features:
-    - Devanagari script recognition (Sanskrit and Hindi)
-    - Adaptive preprocessing for low-confidence results
-    - Unicode NFC normalization for consistent output
-    - Memory-efficient page streaming
-    """
-
-    def __init__(self, use_gpu: bool = False):
-        """
-        Initialize the OCR engine.
-
-        Args:
-            use_gpu: Whether to use GPU acceleration (default False for CPU)
-        """
-        self.use_gpu = use_gpu
-        self._ocr = None
-        self._initialized = False
-
-    def _lazy_init(self) -> None:
-        """Lazily initialize PaddleOCR on first use."""
-        if self._initialized:
-            return
-
-        try:
-            from paddleocr import PaddleOCR
-
-            # Initialize PaddleOCR with Hindi/Devanagari model
-            # Using PP-OCRv3 which has stable support for Hindi ('hi')
-            # The 'hi' language code for Devanagari script (Hindi/Sanskrit)
-            self._ocr = PaddleOCR(
-                lang="hi",  # Hindi/Devanagari script model
-                ocr_version="PP-OCRv3",  # PP-OCRv3 for stable Hindi support
-                use_textline_orientation=True,  # Detect text orientation
-            )
-            self._initialized = True
-            self._use_predict_api = True  # PP-OCRv3 uses predict API
-            logger.info("PaddleOCR initialized with Hindi/Devanagari model (PP-OCRv3)")
-        except Exception as e:
-            # Fallback to devanagari language code without version
-            logger.warning(f"PP-OCRv3 initialization failed: {e}, trying devanagari lang")
-            try:
-                self._ocr = PaddleOCR(
-                    lang="devanagari",  # Try devanagari language code
-                    use_angle_cls=True,
-                )
-                self._initialized = True
-                self._use_predict_api = False  # Legacy API uses .ocr() method
-                logger.info("PaddleOCR initialized with Devanagari model (legacy)")
-            except Exception as e2:
-                # Final fallback: try Chinese model (multilingual)
-                logger.warning(f"Devanagari init failed: {e2}, using multilingual model")
-                try:
-                    self._ocr = PaddleOCR(
-                        lang="ch",  # Chinese/multilingual model
-                        use_angle_cls=True,
-                    )
-                    self._initialized = True
-                    self._use_predict_api = False
-                    logger.info("PaddleOCR initialized with multilingual model (ch)")
-                except ImportError as e3:
-                    raise ImportError(
-                        "PaddleOCR not installed. Install with: pip install paddleocr paddlepaddle"
-                    ) from e3
-
-    def extract_text(self, image_path: Path, page_num: int = 1) -> OCRResult:
-        """
-        Extract text from a single page image.
-
-        Args:
-            image_path: Path to the page image file
-            page_num: Page number for tracking
-
-        Returns:
-            OCRResult with extracted text and metadata
-        """
-        self._lazy_init()
-        start_time = time.time()
-
-        lines = []
-        confidences = []
-
-        if getattr(self, '_use_predict_api', True):
-            # Use predict API (PP-OCRv3/v4/v5)
-            result = self._ocr.predict(input=str(image_path))
-            if result:
-                for res in result:
-                    # PP-OCRv3+ format: uses dict-style access for rec_texts/rec_scores
-                    try:
-                        rec_texts = res['rec_texts'] or []
-                        rec_scores = res['rec_scores'] or []
-                        for text, score in zip(rec_texts, rec_scores):
-                            if text:
-                                lines.append(str(text))
-                                confidences.append(float(score))
-                    except (KeyError, TypeError):
-                        # Alternative format: ocr_result list
-                        if isinstance(res, dict) and "ocr_result" in res:
-                            for item in res.get("ocr_result", []):
-                                text = item.get("text", "")
-                                score = item.get("score", 0.0)
-                                if text:
-                                    lines.append(text)
-                                    confidences.append(score)
-        else:
-            # Use legacy .ocr() API
-            result = self._ocr.ocr(str(image_path), cls=True)
-            if result and result[0]:
-                for line in result[0]:
-                    if len(line) >= 2:
-                        text = line[1][0]  # Extracted text
-                        conf = line[1][1]  # Confidence score
-                        lines.append(text)
-                        confidences.append(conf)
-
-        # Combine text and calculate average confidence
-        full_text = "\n".join(lines)
-        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-
-        # Apply Unicode normalization (NFC)
-        full_text = self.normalize_unicode(full_text)
-
-        processing_time = time.time() - start_time
-
-        # Detect language (basic heuristic based on script patterns)
-        language = self._detect_language(full_text)
-
-        return OCRResult(
-            page_num=page_num,
-            full_text=full_text,
-            confidence=avg_confidence,
-            language_detected=language,
-            processing_time=processing_time,
-            line_count=len(lines),
-            char_count=len(full_text),
-        )
-
-    def extract_with_adaptive_preprocessing(
-        self, image_path: Path, page_num: int = 1
-    ) -> OCRResult:
-        """
-        Extract text with preprocessing applied BEFORE OCR.
-
-        If preprocessing is enabled in config, applies the full pipeline
-        (grayscale → denoise → binarize) before initial OCR attempt.
-        If result is still low confidence, tries original image as fallback.
-
-        Args:
-            image_path: Path to the page image file
-            page_num: Page number for tracking
-
-        Returns:
-            Best OCRResult from preprocessing attempts
-        """
-        config = get_config()
-
-        # If preprocessing is enabled, apply it BEFORE initial OCR
-        if config.OCR_PREPROCESS_ENABLED:
-            logger.debug(f"Page {page_num}: Applying preprocessing pipeline before OCR")
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    tmp_path = Path(tmp.name)
-
-                processed_image = self._apply_preprocessing_pipeline(Image.open(image_path))
-                processed_image.save(tmp_path)
-
-                result = self.extract_text(tmp_path, page_num)
-                tmp_path.unlink()
-
-                if result.is_high_confidence():
-                    return result
-
-                # Low confidence with preprocessing, try original as fallback
-                logger.warning(
-                    f"Page {page_num}: Preprocessed confidence low ({result.confidence:.2%}), "
-                    "trying original image..."
-                )
-                original_result = self.extract_text(image_path, page_num)
-                if original_result.confidence > result.confidence:
-                    logger.info(
-                        f"Page {page_num}: Original image better "
-                        f"({original_result.confidence:.2%} vs {result.confidence:.2%})"
-                    )
-                    return original_result
-                return result
-
-            except Exception as e:
-                logger.warning(f"Page {page_num}: Preprocessing failed ({e}), using original")
-                return self.extract_text(image_path, page_num)
-
-        # Preprocessing disabled: use original approach
-        result = self.extract_text(image_path, page_num)
-
-        if result.is_high_confidence():
-            return result
-
-        logger.warning(
-            f"Page {page_num}: Low confidence ({result.confidence:.2%}), "
-            "trying adaptive preprocessing..."
-        )
-
-        # Try different preprocessing strategies
-        best_result = result
-        preprocessing_strategies = [
-            ("clahe", self._apply_clahe),
-            ("denoise", self._apply_denoise),
-            ("sharpen", self._apply_sharpen),
-            ("binarize", self._apply_binarize),
-        ]
-
-        for strategy_name, preprocess_fn in preprocessing_strategies:
-            try:
-                # Create temporary preprocessed image
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    tmp_path = Path(tmp.name)
-
-                processed_image = preprocess_fn(Image.open(image_path))
-                processed_image.save(tmp_path)
-
-                # Try OCR on preprocessed image
-                new_result = self.extract_text(tmp_path, page_num)
-
-                # Keep if better confidence
-                if new_result.confidence > best_result.confidence:
-                    logger.info(
-                        f"Page {page_num}: {strategy_name} improved confidence "
-                        f"from {best_result.confidence:.2%} to {new_result.confidence:.2%}"
-                    )
-                    best_result = new_result
-
-                # Clean up temp file
-                tmp_path.unlink()
-
-                # Stop if we've reached good enough confidence
-                if best_result.is_high_confidence():
-                    break
-
-            except Exception as e:
-                logger.debug(f"Preprocessing {strategy_name} failed: {e}")
-                continue
-
-        return best_result
-
-    def _apply_preprocessing_pipeline(self, image: Image.Image) -> Image.Image:
-        """
-        Apply full preprocessing pipeline: grayscale → denoise → binarize.
-
-        This pipeline runs BEFORE OCR to improve recognition quality.
-
-        Args:
-            image: Input image
-
-        Returns:
-            Preprocessed image ready for OCR
-        """
-        logger.debug("Applying preprocessing pipeline: grayscale → denoise → binarize")
-
-        # Step 1: Convert to grayscale
-        gray = image.convert("L")
-
-        # Step 2: Denoise
-        try:
-            import cv2
-            import numpy as np
-
-            img_array = np.array(gray)
-            denoised = cv2.fastNlMeansDenoising(img_array, None, 10, 7, 21)
-            gray = Image.fromarray(denoised)
-        except ImportError:
-            gray = gray.filter(ImageFilter.MedianFilter(size=3))
-
-        # Step 3: Binarize (adaptive thresholding)
-        try:
-            import cv2
-            import numpy as np
-
-            img_array = np.array(gray)
-            binary = cv2.adaptiveThreshold(
-                img_array, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY, 11, 2,
-            )
-            return Image.fromarray(binary)
-        except ImportError:
-            return gray.point(lambda x: 255 if x > 128 else 0, mode="1").convert("L")
-
-    def _apply_clahe(self, image: Image.Image) -> Image.Image:
-        """Apply Contrast Limited Adaptive Histogram Equalization."""
-        try:
-            import cv2
-            import numpy as np
-
-            # Convert to grayscale numpy array
-            gray = image.convert("L")
-            img_array = np.array(gray)
-
-            # Apply CLAHE
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(img_array)
-
-            return Image.fromarray(enhanced)
-        except ImportError:
-            # Fallback: simple contrast enhancement
-            enhancer = ImageEnhance.Contrast(image)
-            return enhancer.enhance(1.5)
-
-    def _apply_denoise(self, image: Image.Image) -> Image.Image:
-        """Apply denoising filter."""
-        try:
-            import cv2
-            import numpy as np
-
-            img_array = np.array(image)
-            denoised = cv2.fastNlMeansDenoisingColored(img_array, None, 10, 10, 7, 21)
-            return Image.fromarray(denoised)
-        except ImportError:
-            # Fallback: median filter
-            return image.filter(ImageFilter.MedianFilter(size=3))
-
-    def _apply_sharpen(self, image: Image.Image) -> Image.Image:
-        """Apply sharpening filter."""
-        enhancer = ImageEnhance.Sharpness(image)
-        return enhancer.enhance(2.0)
-
-    def _apply_binarize(self, image: Image.Image) -> Image.Image:
-        """Apply adaptive thresholding for binarization."""
-        try:
-            import cv2
-            import numpy as np
-
-            gray = image.convert("L")
-            img_array = np.array(gray)
-
-            # Adaptive thresholding
-            binary = cv2.adaptiveThreshold(
-                img_array,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                11,
-                2,
-            )
-            return Image.fromarray(binary)
-        except ImportError:
-            # Fallback: simple threshold
-            gray = image.convert("L")
-            return gray.point(lambda x: 255 if x > 128 else 0, mode="1").convert("L")
-
-    def _detect_language(self, text: str) -> str:
-        """
-        Detect if text is primarily Sanskrit or Hindi.
-
-        This is a basic heuristic based on common patterns.
-        For production, consider using a proper language detection API.
-
-        Args:
-            text: Input text in Devanagari
-
-        Returns:
-            Language code ('sa-IN' for Sanskrit, 'hi-IN' for Hindi)
-        """
-        # Sanskrit indicators: more conjunct consonants, vedic markers
-        # Hindi indicators: more common everyday words, specific particles
-
-        # For now, default to Sanskrit as this is primarily for religious texts
-        # The Sarvam API will handle mixed content appropriately
-        return "sa-IN"
-
-    @staticmethod
-    def normalize_unicode(text: str) -> str:
-        """
-        Normalize Unicode text to NFC form.
-
-        NFC (Canonical Composition) ensures consistent representation
-        of Devanagari characters and prevents corruption from different
-        encoding forms.
-
-        Args:
-            text: Input text
-
-        Returns:
-            NFC-normalized text
-        """
-        return unicodedata.normalize("NFC", text)
-
-    @staticmethod
-    def validate_devanagari(text: str) -> bool:
-        """
-        Validate that Devanagari text has no orphaned combining marks.
-
-        Args:
-            text: Input text to validate
-
-        Returns:
-            True if valid
-
-        Raises:
-            ValueError: If orphaned combining marks are found
-        """
-        for i, char in enumerate(text):
-            category = unicodedata.category(char)
-            # Mn = Mark, Nonspacing; Mc = Mark, Spacing Combining; Me = Mark, Enclosing
-            if category in ("Mn", "Mc", "Me"):
-                if i == 0:
-                    raise ValueError(f"Orphaned combining mark at position 0: {repr(char)}")
-                prev_category = unicodedata.category(text[i - 1])
-                # Should follow a letter (Lo, Ll, Lu)
-                if prev_category not in ("Lo", "Ll", "Lu", "Mn", "Mc"):
-                    raise ValueError(
-                        f"Orphaned combining mark at position {i}: {repr(char)}"
-                    )
-        return True
 
 
 def extract_pages_from_pdf(
@@ -882,44 +498,14 @@ def get_pdf_page_count(pdf_path: Path) -> int:
         return len(reader.pages)
 
 
-def create_ocr_engine(
-    backend: Literal["tesseract", "paddle", "auto"] = "auto",
-    **kwargs,
-) -> Union[TesseractOCREngine, OCREngine]:
+def create_ocr_engine(**kwargs) -> TesseractOCREngine:
     """
-    Factory function to create an OCR engine.
+    Factory function to create the Tesseract OCR engine.
 
     Args:
-        backend: OCR backend to use:
-            - "tesseract": Use Tesseract (recommended for Sanskrit manuscripts)
-            - "paddle": Use PaddleOCR (for modern Hindi text)
-            - "auto": Try Tesseract first, fall back to PaddleOCR
-        **kwargs: Additional arguments passed to the OCR engine
+        **kwargs: Arguments passed to TesseractOCREngine (languages, psm)
 
     Returns:
-        Configured OCR engine instance
+        Configured TesseractOCREngine instance
     """
-    if backend == "tesseract":
-        return TesseractOCREngine(**kwargs)
-    elif backend == "paddle":
-        return OCREngine(**kwargs)
-    elif backend == "auto":
-        # Try Tesseract first (better for Sanskrit manuscripts)
-        try:
-            if shutil.which("tesseract"):
-                # Check if Sanskrit language is available
-                result = subprocess.run(
-                    ["tesseract", "--list-langs"],
-                    capture_output=True, text=True
-                )
-                if "san" in result.stdout:
-                    logger.info("Using Tesseract OCR (Sanskrit support detected)")
-                    return TesseractOCREngine(**kwargs)
-        except Exception as e:
-            logger.debug(f"Tesseract check failed: {e}")
-
-        # Fall back to PaddleOCR
-        logger.info("Falling back to PaddleOCR")
-        return OCREngine(**kwargs)
-    else:
-        raise ValueError(f"Unknown OCR backend: {backend}")
+    return TesseractOCREngine(**kwargs)
